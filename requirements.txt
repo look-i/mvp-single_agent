@@ -1,0 +1,20 @@
+# Web Framework
+fastapi
+uvicorn
+
+# LangChain Core & Integrations
+langchain
+langchain-openai
+langchain-community
+
+# Vector Store & PDF/Text Processing
+faiss-cpu
+pypdf
+tiktoken
+
+# Supabase Python Client
+supabase
+
+# Standard utilities
+python-dotenv
+uuid
