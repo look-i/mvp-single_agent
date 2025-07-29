@@ -17,3 +17,4 @@ supabase
 
 # Utilities
 python-dotenv
+python-multipart
