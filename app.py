@@ -1,5 +1,6 @@
 # 导入必要的模块
-from fastapi import FastAPI, HTTPException, Request, Body, File, UploadFile
+from fastapi import FastAPI, HTTPException, Request, Body, File, UploadFile, Depends
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -20,6 +21,7 @@ from langchain_openai import OpenAIEmbeddings
 from langchain.text_splitter import CharacterTextSplitter
 from langchain_community.document_loaders import PyPDFLoader, TextLoader
 from supabase.client import Client, create_client
+from gotrue.errors import AuthApiError
 
 # --- 配置 ---
 
@@ -30,9 +32,9 @@ logger = logging.getLogger(__name__)
 # 从环境变量读取API密钥和Supabase配置
 MOONSHOT_API_KEY = os.getenv("MOONSHOT_API_KEY")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY") # 使用Service Key，因为它有权写入数据库
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY") # 使用Service Key
 
-if not all([MOONSHOT_API_KEY, SUPABASE_URL, SUPABASE_KEY]):
+if not all([MOONSHOT_API_KEY, SUPABASE_URL, SUPABASE_SERVICE_KEY]):
     raise ValueError("环境变量 MOONSHOT_API_KEY, SUPABASE_URL, SUPABASE_SERVICE_KEY 必须全部设置！")
 
 # --- 初始化客户端 ---
@@ -41,17 +43,23 @@ if not all([MOONSHOT_API_KEY, SUPABASE_URL, SUPABASE_KEY]):
 app = FastAPI(title="AI教育单智能体系统 (Supabase版)", description="基于LangChain和Supabase向量数据库的智能体")
 
 # 配置CORS
+origins = [
+    "https://mvp-frontend-ln39.vercel.app",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# 初始化 Supabase 客户端
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-logger.info("Supabase 客户端初始化成功")
+# 初始化一个拥有服务权限的Supabase客户端
+supabase_admin: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+logger.info("Supabase 管理员客户端初始化成功")
 
 # 初始化 LangChain 组件
 # 注意：流式处理在Serverless环境中可能需要特殊配置，这里暂时简化
@@ -71,6 +79,27 @@ embeddings_model = OpenAIEmbeddings(
 
 # --- 数据模型 ---
 
+# --- 认证依赖 ---
+
+auth_scheme = HTTPBearer()
+
+async def get_current_user(token: HTTPAuthorizationCredentials = Depends(auth_scheme)):
+    """验证JWT并返回用户信息"""
+    try:
+        user_response = supabase_admin.auth.get_user(token.credentials)
+        user = user_response.user
+        if not user:
+            raise HTTPException(status_code=401, detail="无效的用户凭证")
+        return user
+    except AuthApiError as e:
+        logger.error(f"JWT 验证失败: {e}")
+        raise HTTPException(status_code=401, detail=f"认证失败: {e}")
+    except Exception as e:
+        logger.error(f"处理认证时发生未知错误: {e}")
+        raise HTTPException(status_code=500, detail="内部服务器错误")
+
+# --- 数据模型 ---
+
 class LessonPlanRequest(BaseModel):
     grade: str
     module: str
@@ -79,7 +108,6 @@ class LessonPlanRequest(BaseModel):
     preferences: List[str]
     custom_requirements: Optional[str] = None
     use_rag: bool = True
-    user_id: Optional[str] = None
 
 # 注意：响应模型现在可以简化，因为前端会直接和Supabase交互来获取和管理教案
 class GeneratedLessonPlan(BaseModel):
@@ -151,13 +179,10 @@ qa_chain = LLMChain(llm=llm, prompt=qa_prompt)
 def get_relevant_documents_from_db(query_text: str, top_k: int = 3) -> str:
     """从Supabase数据库中检索与查询相关的文档"""
     try:
-        # 1. 为查询文本生成向量
         query_embedding = embeddings_model.embed_query(query_text)
-
-        # 2. 调用数据库函数进行相似度搜索
-        res = supabase.rpc('match_documents', {
+        res = supabase_admin.rpc('match_documents', {
             'query_embedding': query_embedding,
-            'match_threshold': 0.7,  # 相似度阈值，可根据效果调整
+            'match_threshold': 0.7,
             'match_count': top_k
         }).execute()
 
@@ -165,7 +190,6 @@ def get_relevant_documents_from_db(query_text: str, top_k: int = 3) -> str:
             logger.info("在数据库中未找到相关文档")
             return "无"
 
-        # 3. 格式化检索到的内容作为上下文
         context = "\n".join([doc['content'] for doc in res.data])
         logger.info(f"已从数据库检索到 {len(res.data)} 条相关内容")
         return context
@@ -181,8 +205,8 @@ async def root():
     return {"message": "AI教育单智能体系统API (Supabase版)"}
 
 @app.post("/generate-lesson-plan", response_model=GeneratedLessonPlan)
-async def generate_lesson_plan(request: LessonPlanRequest):
-    """生成教案"""
+async def generate_lesson_plan(request: LessonPlanRequest, user: dict = Depends(get_current_user)):
+    """生成教案并为用户保存"""
     try:
         context = ""
         if request.use_rag:
@@ -202,17 +226,35 @@ async def generate_lesson_plan(request: LessonPlanRequest):
             context=context
         )
 
+        lesson_plan_data = None
         try:
-            # 尝试直接解析JSON
-            return json.loads(response_text)
+            lesson_plan_data = json.loads(response_text)
         except json.JSONDecodeError:
-            # 如果失败，尝试从Markdown代码块中提取
             import re
             match = re.search(r'```json\n(.*?)\n```', response_text, re.DOTALL)
             if match:
-                return json.loads(match.group(1))
-            logger.error(f"无法解析LLM返回的JSON: {response_text}")
-            raise HTTPException(status_code=500, detail="无法解析生成的教案数据")
+                lesson_plan_data = json.loads(match.group(1))
+            else:
+                logger.error(f"无法解析LLM返回的JSON: {response_text}")
+                raise HTTPException(status_code=500, detail="无法解析生成的教案数据")
+        
+        # 将生成的教案存入数据库，并与用户关联
+        insert_res = supabase_admin.table('lesson_plans').insert({
+            'user_id': user.id,
+            'title': lesson_plan_data.get('title', '未命名教案'),
+            'grade': request.grade,
+            'module': request.module,
+            'knowledge_point': request.knowledge_point,
+            'duration': request.duration,
+            'preferences': request.preferences,
+            'custom_requirements': request.custom_requirements,
+            'content': lesson_plan_data # 存储完整的JSON内容
+        }).execute()
+
+        if not insert_res.data:
+            raise HTTPException(status_code=500, detail="保存教案到数据库失败")
+
+        return lesson_plan_data
 
     except Exception as e:
         logger.error(f"生成教案时出错: {e}")
@@ -220,7 +262,7 @@ async def generate_lesson_plan(request: LessonPlanRequest):
 
 
 @app.post("/qa", response_model=QuestionResponse)
-async def answer_question(request: QuestionRequest):
+async def answer_question(request: QuestionRequest, user: dict = Depends(get_current_user)):
     """回答教学问题"""
     try:
         context = request.context or ""
@@ -230,7 +272,6 @@ async def answer_question(request: QuestionRequest):
 
         answer = qa_chain.run(question=request.question, context=context)
         
-        # 简化响应，只返回核心答案
         return {"answer": answer}
     except Exception as e:
         logger.error(f"回答问题时出错: {e}")
@@ -238,17 +279,18 @@ async def answer_question(request: QuestionRequest):
 
 
 @app.post("/knowledge/upload", status_code=201)
-async def upload_knowledge(file: UploadFile = File(...)):
+async def upload_knowledge(file: UploadFile = File(...), user: dict = Depends(get_current_user)):
     """上传知识库文件，处理并存入Supabase数据库"""
+    if not user:
+        raise HTTPException(status_code=403, detail="只有登录用户才能上传知识库")
+        
     try:
-        # 1. 将上传的文件保存到临时位置
         temp_dir = "temp_uploads"
         os.makedirs(temp_dir, exist_ok=True)
         file_path = os.path.join(temp_dir, file.filename)
         with open(file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
         
-        # 2. 根据文件类型加载文档
         if file.filename.endswith(".pdf"):
             loader = PyPDFLoader(file_path)
         elif file.filename.endswith(".txt"):
@@ -257,26 +299,19 @@ async def upload_knowledge(file: UploadFile = File(...)):
             raise HTTPException(status_code=400, detail="不支持的文件格式，目前仅支持PDF和TXT")
         
         documents = loader.load()
-
-        # 3. 分割文本
         text_splitter = CharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
         texts = text_splitter.split_documents(documents)
-        logger.info(f"文件 {file.filename} 被分割成 {len(texts)} 个文本块")
-
-        # 4. 为每个文本块生成向量并准备数据
+        
         documents_to_insert = []
         for text in texts:
             embedding = embeddings_model.embed_query(text.page_content)
             documents_to_insert.append({
                 'content': text.page_content,
-                'metadata': {'source': file.filename},
+                'metadata': {'source': file.filename, 'uploader_id': user.id},
                 'embedding': embedding
             })
         
-        # 5. 将数据批量插入到Supabase数据库
-        res = supabase.table('documents').insert(documents_to_insert).execute()
-        
-        # 6. 清理临时文件
+        supabase_admin.table('documents').insert(documents_to_insert).execute()
         shutil.rmtree(temp_dir)
 
         return {
@@ -285,7 +320,6 @@ async def upload_knowledge(file: UploadFile = File(...)):
         }
     except Exception as e:
         logger.error(f"上传知识库文件时出错: {e}")
-        # 清理可能的临时文件
         if os.path.exists("temp_uploads"):
             shutil.rmtree("temp_uploads")
         raise HTTPException(status_code=500, detail=f"上传知识库文件失败: {e}")
