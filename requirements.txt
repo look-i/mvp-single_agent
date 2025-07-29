@@ -2,19 +2,18 @@
 fastapi
 uvicorn
 
-# LangChain Core & Integrations
-langchain
+# LangChain - More granular dependencies to reduce size
+langchain-core
 langchain-openai
-langchain-community
+langchain-community # Kept for document loaders
+langchain-text-splitters
 
-# Vector Store & PDF/Text Processing
-faiss-cpu
-pypdf
+# Document Processing & Tokenizer
+pypdf # Dependency for PyPDFLoader
 tiktoken
 
 # Supabase Python Client
 supabase
 
-# Standard utilities
+# Utilities
 python-dotenv
-uuid
